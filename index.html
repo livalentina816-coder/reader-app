@@ -386,45 +386,75 @@ var Modal={open:function(h){$("modalContent").innerHTML=h;$("modalMask").classLi
 /* === 长按选词检测 === */
 var LongPress={
   init:function(){
-    var timer,target;
+    var timer,touchStartX=0,touchStartY=0;
     function clear(){clearTimeout(timer);timer=null}
+
+    /* 核心选词逻辑：支持主文档和 EPUB iframe */
+    function doSelect(doc,x,y){
+      var range;
+      try{
+        if(doc.caretRangeFromPoint){range=doc.caretRangeFromPoint(x,y)}
+        else if(doc.caretPositionFromPoint){var pos=doc.caretPositionFromPoint(x,y);if(pos){range=doc.createRange();range.setStart(pos.offsetNode,pos.offset);range.setEnd(pos.offsetNode,pos.offset)}}
+      }catch(err){return false}
+      if(!range)return false;
+      var sel=doc.getSelection?doc.getSelection():window.getSelection();
+      if(!sel)return false;
+      sel.removeAllRanges();sel.addRange(range);
+      try{sel.modify("extend","forward","word");sel.modify("extend","backward","word")}catch(err){}
+      var word=sel.toString().trim();
+      if(word&&word.length>1){
+        Reader.toggleTopbar(false);
+        AnnotationEngine.hideToolbar();
+        $("selectionToolbar").classList.add("show");
+        setTimeout(function(){AnnotationEngine.positionToolbar()},10);
+        return true;
+      }
+      return false;
+    }
+
+    /* 主文档 touchstart（处理 PDF + EPUB iframe 外触摸） */
     document.addEventListener("touchstart",function(e){
-      var t=e.target;
-      // 在阅读器内容区才触发
       if(!Reader.currentBook)return;
-      var container=Reader.getContentContainer();
-      if(!container||!container.contains(t))return;
+      var t=e.target;
       var touch=e.touches[0];
-      target=t;clear();
+      touchStartX=touch.clientX;touchStartY=touch.clientY;
+      clear();
       timer=setTimeout(function(){
-        // 长按触发：尝试选词
         var x=touch.clientX,y=touch.clientY;
-        var range;
-        try{
-          if(document.caretRangeFromPoint){range=document.caretRangeFromPoint(x,y)}
-          else if(document.caretPositionFromPoint){var pos=document.caretPositionFromPoint(x,y);if(pos){range=document.createRange();range.setStart(pos.offsetNode,pos.offset);range.setEnd(pos.offsetNode,pos.offset)}}
-        }catch(err){return}
-        if(!range)return;
-        // 扩展到单词边界
-        var sel=window.getSelection();
-        sel.removeAllRanges();sel.addRange(range);
-        try{sel.modify("extend","forward","word");sel.modify("extend","backward","word")}catch(err){}
-        var word=sel.toString().trim();
-        if(word&&word.length>1){
-          Reader.toggleTopbar(false);
-          AnnotationEngine.hideToolbar();
-          $("selectionToolbar").classList.add("show");
-          setTimeout(function(){AnnotationEngine.positionToolbar()},10);
+        /* EPUB: 找到对应 iframe，用 iframe 内部 document 选词 */
+        if(Reader.currentBook.format==="epub"){
+          var r=EPUBEngine.getRendition(Reader.currentBook.id);
+          if(r&&r.getContents){
+            try{
+              var contents=r.getContents();
+              for(var i=0;i<contents.length;i++){
+                var iframe=contents[i]&&contents[i].element?contents[i].element.querySelector("iframe"):null;
+                if(!iframe&&contents[i]&&contents[i].iframe){iframe=contents[i].iframe}
+                if(iframe&&iframe.contentDocument){
+                  var rect=iframe.getBoundingClientRect();
+                  if(x>=rect.left&&x<=rect.right&&y>=rect.top&&y<=rect.bottom){
+                    var ix=x-rect.left,iy=y-rect.top;
+                    doSelect(iframe.contentDocument,ix,iy);
+                    return;
+                  }
+                }
+              }
+            }catch(err){}
+          }
+          return;
         }
+        /* PDF: 直接在主文档选词 */
+        var container=Reader.getContentContainer();
+        if(!container||!container.contains(t))return;
+        doSelect(document,x,y);
       },550);
     },{passive:true});
-    document.addEventListener("touchmove",function(e){if(Math.abs(e.touches[0].clientX-(touchStartX||0))>10)clear()},{passive:true});
+
+    document.addEventListener("touchmove",function(e){if(timer&&Math.abs(e.touches[0].clientX-touchStartX)>10)clear()},{passive:true});
     document.addEventListener("touchend",clear);
     document.addEventListener("touchcancel",clear);
   }
 };
-var touchStartX=0;
-document.addEventListener("touchstart",function(e){touchStartX=e.touches[0].clientX},{passive:true});
 
 /* === PDFEngine — PDF 解析与文本重排 === */
 var PDFEngine={
@@ -591,8 +621,28 @@ var EPUBEngine={
 /* === AnnotationEngine === */
 var AnnotationEngine={
   currentSelection:null,
+  _getSelection:function(){
+    /* EPUB: 从 iframe 内获取选区；PDF: 主文档选区 */
+    if(Reader.currentBook&&Reader.currentBook.format==="epub"){
+      try{
+        var r=EPUBEngine.getRendition(Reader.currentBook.id);
+        if(r&&r.getContents){
+          var contents=r.getContents();
+          for(var i=0;i<contents.length;i++){
+            var iframe=contents[i]&&contents[i].element?contents[i].element.querySelector("iframe"):null;
+            if(!iframe&&contents[i]&&contents[i].iframe){iframe=contents[i].iframe}
+            if(iframe&&iframe.contentWindow){
+              var sel=iframe.contentWindow.getSelection();
+              if(sel&&sel.rangeCount>0&&sel.toString().trim())return sel;
+            }
+          }
+        }
+      }catch(e){}
+    }
+    return window.getSelection();
+  },
   captureSelection:function(){
-    var sel=window.getSelection();
+    var sel=this._getSelection();
     if(!sel||sel.rangeCount===0||!sel.toString().trim())return null;
     var range=sel.getRangeAt(0);var text=sel.toString().trim();
     var container=Reader.getContentContainer();
@@ -653,8 +703,9 @@ var AnnotationEngine={
   },
   hideToolbar:function(){$("selectionToolbar").classList.remove("show");$("colorPickerBar").classList.remove("show")},
   positionToolbar:function(el){
-    el=el||$("selectionToolbar");var sel=window.getSelection();if(sel.rangeCount===0)return;
+    el=el||$("selectionToolbar");var sel=this._getSelection();if(!sel||sel.rangeCount===0)return;
     var rect=sel.getRangeAt(0).getBoundingClientRect();
+    /* EPUB iframe 内选区：rect 已是视口坐标，但需确认是否有效 */
     var top=rect.top-50;if(top<60)top=rect.bottom+10;el.style.top=top+"px";
     var left=rect.left+rect.width/2-el.offsetWidth/2;
     if(left<8)left=8;if(left+el.offsetWidth>window.innerWidth-8)left=window.innerWidth-el.offsetWidth-8;
@@ -897,7 +948,7 @@ var Reader={
     if(this.currentBook&&this.currentBook.format==="epub"){var r=EPUBEngine.getRendition(this.currentBook.id);if(r&&r.getContents){try{return r.getContents()[0].document.body}catch(e){}}return null}
     return $("readerContent");
   },
-  _showToolbar:function(){var sel=window.getSelection();if(!sel||!sel.toString().trim())return;AnnotationEngine.hideToolbar();$("selectionToolbar").classList.add("show");setTimeout(function(){AnnotationEngine.positionToolbar()},10)},
+  _showToolbar:function(){var sel=AnnotationEngine._getSelection();if(!sel||!sel.toString().trim())return;AnnotationEngine.hideToolbar();$("selectionToolbar").classList.add("show");setTimeout(function(){AnnotationEngine.positionToolbar()},10)},
   /* 阅读中快捷偏好：同步UI + 实时应用到当前阅读 */
   syncQuickPrefs:function(){
     var prefs=Store.getPrefs();
@@ -985,7 +1036,7 @@ var Reader={
     $("chapterList").innerHTML=this.currentBook.parsedData.chapters.map(function(c,i){return'<li class="'+(i===self.currentChapter?"active":"")+'" data-idx="'+i+'">'+esc(c.title)+'</li>'}).join("");
     $("chapterPanel").classList.add("show");$("panelMask").classList.add("show");
     $("chapterList").querySelectorAll("li").forEach(function(li){
-      li.addEventListener("click",function(){Reader.goToChapter(parseInt(li.getAttribute("data-idx")))});
+      tap(li,function(){Reader.goToChapter(parseInt(li.getAttribute("data-idx")))});
     });
   },
   showChapterMarks:function(){
