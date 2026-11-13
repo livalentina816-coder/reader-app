@@ -231,6 +231,13 @@ body{max-width:720px;margin:0 auto;overflow-x:hidden}
     </div>
   </div>
   <div class="setting-group">
+    <h3>备份与恢复</h3>
+    <div class="hint" style="margin-bottom:10px">导出包含图书文件、阅读进度、标注笔记和设置的完整备份。换设备或换网址时用「恢复」导入即可。</div>
+    <div style="padding:0 4px;margin-bottom:8px"><button class="btn secondary" style="width:100%" onclick="Settings.exportBackup()">📥 导出完整备份</button></div>
+    <div style="padding:0 4px"><button class="btn secondary" style="width:100%" onclick="Settings.importBackup()">📤 恢复备份</button></div>
+    <input type="file" id="backupInput" accept=".json" style="display:none">
+  </div>
+  <div class="setting-group">
     <h3>数据管理</h3>
     <div class="setting-row"><label>存储占用</label><span class="val" id="storageInfo">计算中…</span></div>
     <div style="padding:0 4px;margin-bottom:8px"><button class="danger-btn" onclick="Settings.clearAnnotations()">清空所有标注</button></div>
@@ -1151,7 +1158,83 @@ var Settings={
     else $("storageInfo").textContent="不支持查询";
   },
   clearAnnotations:async function(){if(!confirm("清空所有标注？此操作不可撤销"))return;await DB.clear("annotations");await DB.clear("summaries");toast("已清空所有标注");if($("view-marks").classList.contains("active"))MarksView.render()},
-  clearAll:async function(){if(!confirm("删除所有书籍、标注、进度和摘要？此操作不可撤销"))return;await DB.clear("books");await DB.clear("progress");await DB.clear("annotations");await DB.clear("summaries");toast("已清空所有数据");Shelf.render()}
+  clearAll:async function(){if(!confirm("删除所有书籍、标注、进度和摘要？此操作不可撤销"))return;await DB.clear("books");await DB.clear("progress");await DB.clear("annotations");await DB.clear("summaries");toast("已清空所有数据");Shelf.render()},
+  exportBackup:async function(){
+    showLoading("正在导出备份…");
+    try{
+      var books=await DB.getAll("books");
+      var progress=await DB.getAll("progress");
+      var annotations=await DB.getAll("annotations");
+      var summaries=await DB.getAll("summaries");
+      var prefs=Store.getPrefs();
+      var aiConfig=Store.getAIConfig();
+      /* 将 fileBlob（File/Blob）转为 base64 字符串以便 JSON 序列化 */
+      var booksSerialized=[];
+      for(var i=0;i<books.length;i++){
+        var b=books[i];
+        var fileData=null,fileType=null,fileName=null;
+        if(b.fileBlob){
+          fileData=await new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){rej(r.error)};r.readAsDataURL(b.fileBlob)});
+          fileType=b.fileBlob.type;fileName=b.fileBlob.name||((b.title||"book")+"."+b.format)
+        }
+        var copy={};for(var k in b){if(k!=="fileBlob")copy[k]=b[k]}
+        copy.fileData=fileData;copy.fileType=fileType;copy.fileName=fileName;
+        booksSerialized.push(copy)
+      }
+      var backup={version:1,exportedAt:new Date().toISOString(),books:booksSerialized,progress:progress,annotations:annotations,summaries:summaries,prefs:prefs,aiConfig:aiConfig};
+      var json=JSON.stringify(backup);
+      var blob=new Blob([json],{type:"application/json"});
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement("a");
+      a.href=url;a.download="reader-backup-"+new Date().toISOString().slice(0,10)+".json";
+      document.body.appendChild(a);a.click();document.body.removeChild(a);
+      setTimeout(function(){URL.revokeObjectURL(url)},1000);
+      hideLoading();
+      toast("备份已导出："+booksSerialized.length+" 本书，共 "+(json.length/1024/1024).toFixed(1)+" MB")
+    }catch(e){hideLoading();toast("导出失败："+e.message);console.error(e)}
+  },
+  importBackup:async function(){
+    var input=$("backupInput");
+    input.value="";
+    input.onchange=function(){Settings._doImport(input.files[0])};
+    input.click()
+  },
+  _doImport:async function(file){
+    if(!file){return}
+    showLoading("正在恢复备份…");
+    try{
+      var text=await new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){rej(r.error)};r.readAsText(file)});
+      var backup=JSON.parse(text);
+      if(!backup.version||!backup.books){hideLoading();toast("备份文件格式不正确");return}
+      if(!confirm("将恢复 "+backup.books.length+" 本书及其进度和标注。\n现有数据会被覆盖，是否继续？")){hideLoading();return}
+      /* 清空现有数据 */
+      await DB.clear("books");await DB.clear("progress");await DB.clear("annotations");await DB.clear("summaries");
+      /* 恢复书籍（含文件 Blob） */
+      for(var i=0;i<backup.books.length;i++){
+        var b=backup.books[i];
+        if(b.fileData){
+          var byteString=atob(b.fileData.split(",")[1]);
+          var mimeString=b.fileData.split(",")[0].split(":")[1].split(";")[0];
+          var ab=new ArrayBuffer(byteString.length);
+          var ia=new Uint8Array(ab);
+          for(var j=0;j<byteString.length;j++)ia[j]=byteString.charCodeAt(j);
+          b.fileBlob=new File([ab],b.fileName||"book",{type:b.fileType||mimeString})
+        }
+        delete b.fileData;delete b.fileType;delete b.fileName;
+        await DB.put("books",b)
+      }
+      /* 恢复进度、标注、摘要 */
+      if(backup.progress)for(var i=0;i<backup.progress.length;i++)await DB.put("progress",backup.progress[i]);
+      if(backup.annotations)for(var i=0;i<backup.annotations.length;i++)await DB.put("annotations",backup.annotations[i]);
+      if(backup.summaries)for(var i=0;i<backup.summaries.length;i++)await DB.put("summaries",backup.summaries[i]);
+      /* 恢复设置 */
+      if(backup.prefs)Store.setPrefs(backup.prefs);
+      if(backup.aiConfig)Store.setAIConfig(backup.aiConfig);
+      hideLoading();
+      toast("恢复成功："+backup.books.length+" 本书");
+      Settings.render();Shelf.render()
+    }catch(e){hideLoading();toast("恢复失败："+e.message);console.error(e)}
+  }
 };
 
 /* === 阅读器内容区的选区工具栏（非长按场景，如桌面端选中） === */
